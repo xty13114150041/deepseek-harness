@@ -49,6 +49,14 @@ import { parseCodexConfig, type CodexHookConfig } from './config.ts'
 export const name = 'hooks-codex'
 export const inject = ['shell', 'agents', 'workingDirectory']
 
+/**
+ * Message sources that count as a prompt submission. `MessageSourceMap` is open,
+ * and producers deliver synthetic context as user-role messages with their own
+ * kinds (`ptc-mode`, `sidechat`, `subagent-settled`, …), so `step === 1` alone
+ * is not a prompt-submission signal.
+ */
+const PROMPT_SOURCE_KINDS: ReadonlySet<string> = new Set(['user', 'schedule'])
+
 /** Plugin config: where the Codex hooks.json lives + the model name for payloads. */
 export interface Config {
   /**
@@ -203,11 +211,18 @@ export function apply(ctx: Context, config: Config): void {
 
   // UserPromptSubmit → PreStepDecision. Codex supports reject, not rewrite or ask.
   ctx.on('agent/pre-step', async ({ agent, messages, turn, signal }, next): Promise<PreStepDecision> => {
-    if (messages.length === 0) return next()
+    // A delegated subagent's first message is its parent-authored task book, not
+    // a human prompt; audit bridges mounted in subagents must not recall.
+    const header = agent.session.header
+    if (header.origin === 'subagent' || (header.delegationDepth ?? 0) > 0) return next()
+    // Only prompt submissions enter the hook: PTC deferrals, side-chat
+    // inheritance blocks, and subagent results are synthetic user-role context.
+    const prompts = messages.filter(message => PROMPT_SOURCE_KINDS.has(message.source.kind))
+    if (prompts.length === 0) return next()
     const payload = {
       ...base(agent, 'UserPromptSubmit', model),
       turn_id: String(turn),
-      prompt: extractTextContent(messages.flatMap(message => message.content)),
+      prompt: extractTextContent(prompts.flatMap(message => message.content)),
     }
     const merged = await runPoint('UserPromptSubmit', '', payload, {
       agent, turn, plainStdoutAsContext: true, signal,
